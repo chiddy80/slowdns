@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2021"
 authors = ["RASHID KAMOE <rashidkamote95@gmail.com>"]
 description = "Modern SlowDNS Installation Script"
-repository = "https://github.com/chiddy80/slowdns/new/main"
+repository = "https://github.com/chiddy80/slowdns"
 license = "MIT"
 readme = "README.md"
 
