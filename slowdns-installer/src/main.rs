@@ -6,6 +6,8 @@ use std::thread;
 use std::time::Duration;
 use std::os::unix::fs::PermissionsExt;
 use std::env;
+use std::net::{UdpSocket, SocketAddr};
+use std::sync::Arc;
 
 use colored::*;
 use console::Term;
@@ -350,195 +352,176 @@ WantedBy=multi-user.target
         self.print_step(4, "COMPILE EDNS PROXY");
         self.print_info("Compiling high-performance EDNS Proxy");
         
-        self.show_progress("Checking for compiler tools...", 300);
-        if self.run_command("which gcc").is_err() {
-            self.print_info("Installing gcc...");
-            self.run_command("apt-get update > /dev/null 2>&1")?;
-            self.run_command("apt-get install -y gcc > /dev/null 2>&1")?;
-            self.print_success("Compiler installed");
-        }
+        self.show_progress("Creating Rust proxy...", 500);
         
-        let c_code = "#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <sys/epoll.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <time.h>
+        let proxy_code = r#"use std::net::{UdpSocket, SocketAddr};
+use std::io;
+use std::thread;
+use std::sync::Arc;
+use std::time::Duration;
 
-#define EXT_EDNS 512
-#define INT_EDNS 1800
-#define SLOWDNS_PORT 5300
-#define LISTEN_PORT 53
-#define BUFFER_SIZE 4096
-#define MAX_EVENTS 100
+const SLOWDNS_PORT: u16 = 5300;
+const LISTEN_PORT: u16 = 53;
+const BUFFER_SIZE: usize = 4096;
+const EXT_EDNS: u16 = 512;
+const INT_EDNS: u16 = 1800;
 
-typedef struct {
-    int client_fd;
-    struct sockaddr_in client_addr;
-    socklen_t addr_len;
-    time_t timestamp;
-} request_t;
-
-int patch_edns(unsigned char *buf, int len, int new_size) {
-    if(len < 12) return len;
-    int offset = 12;
-    int qdcount = (buf[4] << 8) | buf[5];
-    for(int i = 0; i < qdcount && offset < len; i++) {
-        while(offset < len && buf[offset]) offset++;
+fn patch_edns(buf: &mut [u8], new_size: u16) -> usize {
+    if buf.len() < 12 {
+        return buf.len();
+    }
+    
+    let mut offset = 12;
+    let qdcount = ((buf[4] as u16) << 8) | (buf[5] as u16);
+    
+    for _ in 0..qdcount {
+        if offset >= buf.len() {
+            break;
+        }
+        while offset < buf.len() && buf[offset] != 0 {
+            offset += 1;
+        }
         offset += 5;
     }
-    int arcount = (buf[10] << 8) | buf[11];
-    for(int i = 0; i < arcount && offset < len; i++) {
-        if(buf[offset] == 0 && offset + 4 < len) {
-            int type = (buf[offset+1] << 8) | buf[offset+2];
-            if(type == 41) {
-                buf[offset+3] = new_size >> 8;
-                buf[offset+4] = new_size & 0xFF;
-                return len;
+    
+    let arcount = ((buf[10] as u16) << 8) | (buf[11] as u16);
+    
+    for _ in 0..arcount {
+        if offset + 4 >= buf.len() {
+            break;
+        }
+        
+        if buf[offset] == 0 {
+            let rrtype = ((buf[offset + 1] as u16) << 8) | (buf[offset + 2] as u16);
+            if rrtype == 41 {
+                buf[offset + 3] = (new_size >> 8) as u8;
+                buf[offset + 4] = (new_size & 0xFF) as u8;
+                break;
             }
         }
-        offset++;
+        offset += 1;
     }
-    return len;
+    
+    buf.len()
 }
 
-int set_nonblock(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if(flags < 0) return -1;
-    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
-int main() {
-    printf(\"[EDNS Proxy] Starting high-performance DNS proxy...\\n\");
+fn handle_client(slowdns_addr: SocketAddr, data: &[u8], client_addr: SocketAddr, listen_socket: Arc<UdpSocket>) {
+    let mut modified_data = data.to_vec();
+    patch_edns(&mut modified_data, INT_EDNS);
     
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if(sock < 0) {
-        perror(\"[ERROR] socket\");
-        return 1;
-    }
-    
-    if(set_nonblock(sock) < 0) {
-        perror(\"[ERROR] fcntl\");
-        close(sock);
-        return 1;
-    }
-    
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(LISTEN_PORT);
-    addr.sin_addr.s_addr = INADDR_ANY;
-    
-    if(bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror(\"[ERROR] bind\");
-        close(sock);
-        return 1;
-    }
-    
-    int epoll_fd = epoll_create1(0);
-    if(epoll_fd < 0) {
-        perror(\"[ERROR] epoll_create1\");
-        close(sock);
-        return 1;
-    }
-    
-    struct epoll_event ev;
-    ev.events = EPOLLIN;
-    ev.data.fd = sock;
-    
-    if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev) < 0) {
-        perror(\"[ERROR] epoll_ctl\");
-        close(epoll_fd);
-        close(sock);
-        return 1;
-    }
-    
-    printf(\"[EDNS Proxy] Listening on port 53 (epoll optimized)\\n\");
-    printf(\"[EDNS Proxy] Ready to handle DNS queries\\n\");
-    
-    struct epoll_event events[MAX_EVENTS];
-    request_t *requests[10000] = {0};
-    
-    while(1) {
-        int n = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
-        for(int i = 0; i < n; i++) {
-            if(events[i].data.fd == sock) {
-                unsigned char buffer[BUFFER_SIZE];
-                struct sockaddr_in client_addr;
-                socklen_t client_len = sizeof(client_addr);
-                int len = recvfrom(sock, buffer, BUFFER_SIZE, 0,
-                                 (struct sockaddr*)&client_addr, &client_len);
-                if(len > 0) {
-                    patch_edns(buffer, len, INT_EDNS);
-                    int up_sock = socket(AF_INET, SOCK_DGRAM, 0);
-                    if(up_sock >= 0) {
-                        set_nonblock(up_sock);
-                        request_t *req = malloc(sizeof(request_t));
-                        if(req) {
-                            req->client_fd = sock;
-                            req->client_addr = client_addr;
-                            req->addr_len = client_len;
-                            req->timestamp = time(NULL);
-                            requests[up_sock] = req;
-                            struct epoll_event up_ev;
-                            up_ev.events = EPOLLIN;
-                            up_ev.data.fd = up_sock;
-                            epoll_ctl(epoll_fd, EPOLL_CTL_ADD, up_sock, &up_ev);
-                            struct sockaddr_in up_addr;
-                            memset(&up_addr, 0, sizeof(up_addr));
-                            up_addr.sin_family = AF_INET;
-                            up_addr.sin_port = htons(SLOWDNS_PORT);
-                            inet_pton(AF_INET, \"127.0.0.1\", &up_addr.sin_addr);
-                            sendto(up_sock, buffer, len, 0,
-                                   (struct sockaddr*)&up_addr, sizeof(up_addr));
-                        } else {
-                            close(up_sock);
-                        }
+    match UdpSocket::bind("0.0.0.0:0") {
+        Ok(upstream_socket) => {
+            if upstream_socket.send_to(&modified_data, slowdns_addr).is_ok() {
+                let mut buffer = [0u8; BUFFER_SIZE];
+                match upstream_socket.recv_from(&mut buffer) {
+                    Ok((len, _)) => {
+                        patch_edns(&mut buffer[..len], EXT_EDNS);
+                        let _ = listen_socket.send_to(&buffer[..len], client_addr);
                     }
-                }
-            } else {
-                int up_sock = events[i].data.fd;
-                request_t *req = requests[up_sock];
-                if(req) {
-                    unsigned char buffer[BUFFER_SIZE];
-                    int len = recv(up_sock, buffer, BUFFER_SIZE, 0);
-                    if(len > 0) {
-                        patch_edns(buffer, len, EXT_EDNS);
-                        sendto(req->client_fd, buffer, len, 0,
-                               (struct sockaddr*)&req->client_addr,
-                               req->addr_len);
-                    }
-                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, up_sock, NULL);
-                    close(up_sock);
-                    free(req);
-                    requests[up_sock] = NULL;
+                    Err(_) => {}
                 }
             }
         }
+        Err(_) => {}
     }
-    return 0;
-}";
+}
+
+fn main() -> io::Result<()> {
+    println!("[EDNS Proxy] Starting high-performance DNS proxy in Rust...");
+    
+    let socket = UdpSocket::bind(("0.0.0.0", LISTEN_PORT))?;
+    socket.set_nonblocking(true)?;
+    
+    println!("[EDNS Proxy] Listening on port 53");
+    println!("[EDNS Proxy] Ready to handle DNS queries");
+    
+    let slowdns_addr: SocketAddr = format!("127.0.0.1:{}", SLOWDNS_PORT).parse().unwrap();
+    let socket_arc = Arc::new(socket);
+    
+    let mut buffer = [0u8; BUFFER_SIZE];
+    
+    loop {
+        match socket_arc.recv_from(&mut buffer) {
+            Ok((len, client_addr)) => {
+                let data = buffer[..len].to_vec();
+                let slowdns_addr_clone = slowdns_addr;
+                let socket_clone = Arc::clone(&socket_arc);
+                
+                thread::spawn(move || {
+                    handle_client(slowdns_addr_clone, &data, client_addr, socket_clone);
+                });
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                eprintln!("Error receiving data: {}", e);
+            }
+        }
+    }
+}"#;
         
-        let c_file = Path::new("/tmp/edns.c");
-        fs::write(c_file, c_code)?;
+        let proxy_file = Path::new("/tmp/edns_proxy.rs");
+        fs::write(proxy_file, proxy_code)?;
         
-        self.show_progress("Compiling EDNS Proxy with O3 optimizations...", 1000);
-        let compile_cmd = "gcc -O3 -march=native -pipe /tmp/edns.c -o /usr/local/bin/edns-proxy";
+        self.show_progress("Compiling Rust proxy...", 1000);
+        
+        let compile_cmd = "rustc --release -o /usr/local/bin/edns-proxy /tmp/edns_proxy.rs 2>/tmp/rust_compile.log";
         match self.run_command(compile_cmd) {
             Ok(_) => {
                 let edns_binary = Path::new("/usr/local/bin/edns-proxy");
                 let mut perms = fs::metadata(edns_binary)?.permissions();
                 perms.set_mode(0o755);
                 fs::set_permissions(edns_binary, perms)?;
-                self.print_success("EDNS Proxy compiled successfully");
+                self.print_success("EDNS Proxy compiled successfully in Rust");
             }
             Err(e) => {
-                self.print_error(&format!("Compilation failed: {}", e));
-                return Err(e);
+                self.print_error(&format!("Rust compilation failed: {}", e));
+                self.print_info("Falling back to simple Rust implementation...");
+                
+                let simple_proxy = r#"use std::net::{UdpSocket, SocketAddr};
+use std::io;
+
+const SLOWDNS_PORT: u16 = 5300;
+const LISTEN_PORT: u16 = 53;
+const BUFFER_SIZE: usize = 4096;
+
+fn main() -> io::Result<()> {
+    println!("[Simple EDNS Proxy] Starting DNS proxy...");
+    
+    let socket = UdpSocket::bind(("0.0.0.0", LISTEN_PORT))?;
+    println!("[Simple EDNS Proxy] Listening on port 53");
+    
+    let slowdns_addr: SocketAddr = format!("127.0.0.1:{}", SLOWDNS_PORT).parse().unwrap();
+    let mut buffer = [0u8; BUFFER_SIZE];
+    
+    loop {
+        match socket.recv_from(&mut buffer) {
+            Ok((len, client_addr)) => {
+                let data = &buffer[..len];
+                
+                let upstream_socket = UdpSocket::bind("0.0.0.0:0")?;
+                
+                if upstream_socket.send_to(data, &slowdns_addr).is_ok() {
+                    let mut response_buffer = [0u8; BUFFER_SIZE];
+                    match upstream_socket.recv_from(&mut response_buffer) {
+                        Ok((response_len, _)) => {
+                            let _ = socket.send_to(&response_buffer[..response_len], client_addr);
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+            }
+        }
+    }
+}"#;
+                
+                fs::write("/tmp/simple_proxy.rs", simple_proxy)?;
+                self.run_command("rustc --release -o /usr/local/bin/edns-proxy /tmp/simple_proxy.rs")?;
+                self.print_success("Simple Rust proxy compiled");
             }
         }
         
@@ -578,7 +561,8 @@ WantedBy=multi-user.target
         
         self.show_progress("Setting up firewall rules...", 800);
         
-                let firewall_commands = vec![
+                
+        let firewall_commands = vec![
             "iptables -F".to_string(),
             "iptables -X".to_string(),
             "iptables -t nat -F".to_string(),
@@ -856,8 +840,9 @@ WantedBy=multi-user.target
 
     fn cleanup(&self) -> Result<(), Box<dyn std::error::Error>> {
         let temp_files = [
-            Path::new("/tmp/edns.c"),
-            Path::new("/tmp/compile.log"),
+            Path::new("/tmp/edns_proxy.rs"),
+            Path::new("/tmp/simple_proxy.rs"),
+            Path::new("/tmp/rust_compile.log"),
             Path::new("/var/log/slowdns-install.log"),
         ];
         
@@ -920,4 +905,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 }
-```"
+```
