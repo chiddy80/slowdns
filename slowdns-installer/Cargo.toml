@@ -7,9 +7,8 @@ edition = "2021"
 reqwest = { version = "0.11", features = ["blocking"] }
 indicatif = "0.17"
 colored = "2.0"
-crossterm = "0.27"
 console = "0.15"
 dialoguer = "0.11"
 chrono = "0.4"
-nix = { version = "0.27", features = ["user"] }  # Added 'user' feature
-anyhow = "1.0"  # For better error handling
+nix = { version = "0.27", features = ["user"] }
+anyhow = "1.0"
